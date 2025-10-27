@@ -1,0 +1,600 @@
+---
+title: "Fibrinogen - Haptoglobin: DESeq2 analysis of KOS"
+author: "Gabriela Puerres"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+# R Markdown setup chunk
+# Define your base paths
+base_dir   <- path.expand("C:/Users/diana/OneDrive - purdue.edu/Master/Slivozkyi_Lab/Projects/Cow_Inflammation_Study/PICRUst2/DESeq2/Fibrinogen_Haptoglobin_Final/")
+cache_dir  <- paste0(file.path(base_dir, "Files/Cache"), "/")
+fig_dir    <- paste0(file.path(base_dir, "Files/Figures/"), "/")
+
+# Create directories if they don't already exist
+dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir,   recursive = TRUE, showWarnings = FALSE)
+
+# Set knitr chunk options
+knitr::opts_chunk$set(
+  fig.keep      = "all",
+  fig.path      = fig_dir,  
+  cache         = TRUE,
+  cache.lazy    = FALSE,
+  cache.comments= FALSE,
+  cache.path    = cache_dir)  # ends with a slash
+```
+
+# Input Data & Metadata
+
+```{r data, message=FALSE, warning=FALSE}
+# packages
+library(phyloseq)
+library(DESeq2)
+library(tidyverse)
+library(pheatmap)
+library(ggplot2)
+library(apeglm)
+library(reactable)
+library(DT)
+
+# Working directory:
+setwd("C:/Users/diana/OneDrive - purdue.edu/Master/Slivozkyi_Lab/Projects/Cow_Inflammation_Study/PICRUst2/")
+
+# files: PICRUSt2 table ================================
+picrust_file <- "Results/KO_metagenome_out/pred_metagenome_unstrat.tsv/pred_metagenome_unstrat.tsv"
+data <- read.delim(picrust_file, check.names = FALSE, stringsAsFactors = FALSE)
+remove_samples <- c("mock-synthetic-ZYMO-1",
+                    "mock-synthetic-ZYMO-2",
+                    "mock-synthetic-ZYMO-3",
+                    "mock-synthetic-ZYMO-4",
+                    "mock-synthetic-ZYMO-5")
+
+data <- data[, !colnames(data) %in% remove_samples]
+dim(data)
+datatable(data, options = list(
+dom = 'Bfrtip', # show buttons, filter, table
+pageLength = 10,
+lengthMenu = c(10, 15, 25, 50, 100),
+scrollX = TRUE,
+scrollY = "400px"))
+
+# assume first column is feature IDs: KO
+feat_col <- colnames(data)[1]
+rownames(data) <- data[[feat_col]]
+data[[feat_col]] <- NULL
+data <- as.matrix(data) 
+
+
+# files: meta table ================================
+
+meta_file <- "C:/Users/diana/OneDrive - purdue.edu/Master/Slivozkyi_Lab/Projects/Cow_Inflammation_Study/PICRUst2/Updated_Cow_Metadata.csv"
+metadata_clean <- read.csv(meta_file, header = TRUE, row.names = 1)
+metadata_clean <- metadata_clean %>%  filter(Sample_Type == "Feces")
+all(colnames(data) %in% rownames(metadata_clean))
+# Subset metadata
+covariates <- c("Sample_ID", "ExtractionDate","DIM_Collected", 
+ "Parity", "BCS", "Fibrinogen_InflamStat",  "Haptoglobin_InflamStat", "qpcr_16s_copies_ul", "nonchim")
+
+metadata <- metadata_clean[, covariates]
+
+# Re-define parity: Uniparous (Parity = 1) vs Multiparous (Parity > 1).
+metadata$Parity_Classification <- ifelse(metadata$Parity == 1,
+                                         "Uniparous",
+                                         "Multiparous")
+
+
+# Convert all to factors
+metadata$ExtractionDate <-factor(metadata$ExtractionDate)
+metadata$DIM_Collected <- factor(metadata$DIM_Collected)
+metadata$Parity_Classification <- factor(metadata$Parity_Classification)
+metadata$BCS <- factor(metadata$BCS)
+metadata$Fibrinogen_InflamStat <- factor(metadata$Fibrinogen_InflamStat)
+metadata$Haptoglobin_InflamStat <- factor(metadata$Haptoglobin_InflamStat)
+
+# for copy number
+metadata$qpcr_16s_copies_ul <-  gsub(",", "", metadata$qpcr_16s_copies_ul)
+metadata$qpcr_16s_copies_ul <- as.numeric(metadata$qpcr_16s_copies_ul)
+metadata$qpcr_16s_copies_ul <- scale(metadata$qpcr_16s_copies_ul, center = T, scale = T) #mean-centered, variance-standardized f
+
+#for nochim
+metadata$nonchim <- as.numeric(metadata$nonchim)
+metadata$nonchim <- scale(metadata$nonchim, center =T, scale = T)
+```
+
+# Fibrinogen Model
+
+The model takes into account the effect of Parity, Days in Milk (DIM), Body Condition Score (BCS) + 16s qPCR Copy Number (qpcr_16s_copies_ul).
+
+1.  Data set for DESeq2:
+
+```{r DESeqDataSetFromMatrix}
+library("DESeq2")
+
+# Convert PICRUSt2 output to integer table
+countmat <- round(data)
+
+# DESeq2 object
+dds <- DESeqDataSetFromMatrix(countData = countmat,
+                              colData = metadata,
+                              design = ~ Fibrinogen_InflamStat)
+dds
+
+# estimates size factors that normalize the count data to account for differences in sequencing depth (library size) or total counts per sample: 
+dds <- estimateSizeFactors(dds, type = "poscounts")
+head(sizeFactors(dds))
+```
+
+2.  Filtration of KOs. Prevalence cutoff of 5%
+
+```{r}
+# keeps only those KOs that are expressed above the prevalence cutoff:
+# Set prevalence cutoff threshold:
+prevalence_cutoff <- 0.05
+counts_mat <- counts(dds)
+prevalence <- rowSums(counts_mat > 1) / ncol(counts_mat)
+keep <- prevalence >= prevalence_cutoff
+dds_filtered <- dds[keep, ]
+dds_filtered
+```
+
+3.  Run DESeq2:
+
+```{r}
+#  copy of the DESeqDataSet
+dds_fb <- dds_filtered 
+
+# using relevel, just specifying the reference level:
+dds_fb$Fibrinogen_InflamStat <- relevel(dds_fb$Fibrinogen_InflamStat, ref = "Normal")
+
+# re-run DESeq:
+design(dds_fb) <- formula(~ Fibrinogen_InflamStat + Parity_Classification + DIM_Collected + BCS + qpcr_16s_copies_ul)
+
+dds_fb <- DESeq(dds_fb, 
+                 test = "Wald", 
+                 fitType = "parametric")
+```
+
+4.  DESeq Results and Log2 Fold Change Shrinkage
+
+```{r}
+alpha <- 0.01
+resultsNames(dds_fb)
+
+res_fb <- results(dds_fb,
+                   alpha = alpha,
+                   name = "Fibrinogen_InflamStat_Elevated_vs_Normal")
+summary(res_fb)
+
+# Log2 Fold Change Shrink
+res_LFC_fb <- lfcShrink(dds_fb, 
+                         type = "ashr", 
+                         res = res_fb)
+
+# Filter for significant results
+res_LFC_fb <- res_LFC_fb[which(res_LFC_fb$padj < 0.01 & 
+                               abs(res_LFC_fb$log2FoldChange) > 2), ]
+summary(res_LFC_fb)
+
+# Order LFC results by adjusted P values
+res_LFC_fb_df <- as.data.frame(res_LFC_fb[order(res_LFC_fb$padj, na.last = NA), ])
+sum(res_LFC_fb_df$padj < 0.01, na.rm = TRUE)
+
+# Keep only KOs with adjusted p-value < 0.01
+res_LFC_fb_df <- res_LFC_fb_df[
+  res_LFC_fb_df$padj < 0.01 & !is.na(res_LFC_fb_df$padj), ]
+dim(res_LFC_fb_df)
+
+# Save File
+write.csv(res_LFC_fb, "DESeq2/Files/Results/Fibrinogen_full_model.csv")
+
+# Plots
+plotMA(res_fb, ylim = c(-30, 30))  # after DESeq2
+plotMA(res_LFC_fb, ylim = c(-30, 30))  # after Log2 Fold Change shrinkage
+```
+
+5.  Volcano plot of significant p adjusted values
+
+```{r Volcano_plot}
+library(ggplot2)
+library(ggrepel)
+
+# Add threshold labels
+res_df <- res_LFC_fb_df
+res_df$significant <- ifelse(res_df$padj < 0.01 & abs(res_df$log2FoldChange) > 1,
+                             "Significant", "Not significant")
+
+# 10 top genes
+top_genes <- res_df[which(res_df$padj < 0.01 & abs(res_df$log2FoldChange) > 2), ]
+
+# Volcano plot
+ggplot(res_df, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = significant), alpha = 0.7, size = 2) +
+  scale_color_manual(values = c("Significant" = "red", "Not significant" = "gray")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.01), linetype = "dashed", color = "black") +
+  labs(title = "Fibrinogen KOs -Volcano Plot",
+       x = expression(Log[2]~Fold~Change),
+       y = expression(-Log[10]~Adjusted~p~value)) + geom_text_repel(data = top_genes,
+                  aes(label = rownames(top_genes)),
+                  size = 3, box.padding = 0.3, max.overlaps = 10) + theme_minimal(base_size = 14)
+
+
+```
+
+```{r Fb_Significant_KOs_Table}
+# Display table
+head(res_LFC_fb_df)
+
+library(reactable)
+library(DT)
+
+res_df <- res_LFC_fb_df
+if (!"KOs" %in% colnames(res_df)) {
+res_df <- cbind(KOs = rownames(res_df), res_df)
+rownames(res_df) <- NULL
+}
+
+datatable(
+res_df,
+extensions = c('Buttons', 'Responsive', 'Scroller'),
+options = list(
+dom = 'Bfrtip', # show buttons, filter, table
+buttons = c('copy', 'csv', 'excel', 'pdf'),
+pageLength = 15,
+lengthMenu = c(10, 15, 25, 50, 100),
+scrollX = TRUE,
+scrollY = "400px",
+deferRender = TRUE,
+scroller = TRUE
+),
+filter = 'top',
+rownames = FALSE,
+class = 'stripe hover compact'
+)
+```
+
+```{r fb_Anotation}
+library(KEGGREST)
+
+# KOs names:
+KOs_names_Fibrinogen <- rownames(res_LFC_fb_df)
+KOs_names_Fibrinogen <- gsub("ko:", "", KOs_names_Fibrinogen)
+res_LFC_fb_df$X <- KOs_names_Fibrinogen
+
+
+# Retrieve pathways for each KO
+names(KOs_names_Fibrinogen) <- KOs_names_Fibrinogen
+
+Fibrinogen_info <- lapply(KOs_names_Fibrinogen, function(ko) {
+  ko_entry <- tryCatch(keggGet(paste0("ko:", ko))[[1]], error = function(e) NULL)
+  ec_name <- if (!is.null(ko_entry) && !is.null(ko_entry$NAME)) ko_entry$NAME[1] else NA
+  
+  res <- tryCatch(keggLink("pathway", paste0("ko:", ko)), error = function(e) NULL)
+  if (!is.null(res) && length(res) > 0) {
+    path_ids <- sub("path:", "", res)
+    path_names <- sapply(path_ids, function(pid)
+      tryCatch(keggGet(pid)[[1]]$NAME, error = function(e) NA))
+    list(EC_name = ec_name, Pathway = unique(na.omit(path_names)))
+  } else {
+    list(EC_name = ec_name, Pathway = NA)
+  }
+})
+
+# Convert list to dataframe
+Fibrinogen_info_df <- do.call(rbind, lapply(Fibrinogen_info, function(x) {
+  # If multiple pathways, collapse into a single string separated by "; "
+  pathway <- if (is.na(x$Pathway[1])) NA else paste(x$Pathway, collapse = "; ")
+  data.frame(EC_name = x$EC_name, Pathway = pathway, stringsAsFactors = FALSE)
+}))
+
+#Update Data frame:
+rownames(Fibrinogen_info_df) <- names(KOs_names_Fibrinogen)
+
+Fibrinogen_merged <- cbind(res_LFC_fb_df,
+                            Fibrinogen_info_df[res_LFC_fb_df$X, ])
+
+write.csv(Fibrinogen_merged, "DESeq2/Files/Results/Fibrinogen_with_KEGG_info.csv")
+```
+
+```{r annotation_fb}
+head(Fibrinogen_merged)
+dim(Fibrinogen_merged)
+
+head(rownames(Fibrinogen_merged))
+# Annotated table
+
+res_df_fb <- Fibrinogen_merged
+res_df_fb$Pathway <- enc2utf8(as.character(res_df_fb$Pathway))
+res_df_fb$EC_name <- enc2utf8(as.character(res_df_fb$EC_name))
+```
+
+```{r datatable_fb}
+colnames(res_df_fb)
+head(rownames(res_df_fb))
+if (!"KOs" %in% colnames(res_df_fb)) {
+  res_df_fb <- cbind(KOs = rownames(res_df_fb), res_df_fb)
+  rownames(res_df_fb) <- NULL}
+
+
+head(res_df_fb)
+
+library(DT)
+# Dataframe
+DT::datatable(
+  res_df_fb,
+  extensions = 'Buttons',
+  options = list(
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel', 'pdf'),
+    pageLength = 10,
+    lengthMenu = c(10, 15, 25, 50, 100),
+    scrollX = TRUE
+  ),
+  filter = 'top',
+  rownames = FALSE,
+  class = 'stripe hover compact')
+```
+
+# Haptoglobin Model
+
+The model takes into account the effect of Parity, Days in Milk (DIM), Body Condition Score (BCS) + 16s qPCR Copy Number (qpcr_16s_copies_ul).
+
+1.  Data set for DESeq2:
+
+```{r Hp_DESeqDataSetFromMatrix}
+library("DESeq2")
+
+# Convert PICRUSt2 output to integer table
+countmat <- round(data)
+
+# DESeq2 object
+dds <- DESeqDataSetFromMatrix(countData = countmat,
+                              colData = metadata,
+                              design = ~ Haptoglobin_InflamStat)
+dds
+
+# estimates size factors that normalize the count data to account for differences in sequencing depth (library size) or total counts per sample: 
+dds <- estimateSizeFactors(dds, type = "poscounts")
+head(sizeFactors(dds))
+```
+
+2.  Filtration of KOs. Prevalence cutoff of 5%
+
+```{r filtration}
+# keeps only those KOs that are expressed above the prevalence cutoff:
+# Set prevalence cutoff threshold:
+prevalence_cutoff <- 0.05
+counts_mat <- counts(dds)
+prevalence <- rowSums(counts_mat > 1) / ncol(counts_mat)
+keep <- prevalence >= prevalence_cutoff
+dds_filtered <- dds[keep, ]
+dds_filtered
+```
+
+3.  Run DESeq2:
+
+```{r DESeq}
+#  copy of the DESeqDataSet
+dds_hp <- dds_filtered 
+
+# using relevel, just specifying the reference level:
+dds_hp$Haptoglobin_InflamStat <- relevel(dds_hp$Haptoglobin_InflamStat, ref = "Normal")
+
+# re-run DESeq:
+design(dds_hp) <- formula(~ Haptoglobin_InflamStat + Parity_Classification + DIM_Collected + BCS + qpcr_16s_copies_ul)
+
+dds_hp <- DESeq(dds_hp, 
+                 test = "Wald", 
+                 fitType = "parametric")
+```
+
+4.  DESeq Results and Log2 Fold Change Shrinkage
+
+```{r DESeq_Results}
+alpha <- 0.01
+resultsNames(dds_hp)
+
+res_hp <- results(dds_hp,
+                   alpha = alpha,
+                   name = "Haptoglobin_InflamStat_Elevated_vs_Normal")
+summary(res_hp)
+
+# Log2 Fold Change Shrink
+res_LFC_hp <- lfcShrink(dds_hp, 
+                         type = "ashr", 
+                         res = res_hp)
+
+# Filter for significant results
+res_LFC_hp <- res_LFC_hp[which(res_LFC_hp$padj < 0.01 & 
+                               abs(res_LFC_hp$log2FoldChange) > 2), ]
+summary(res_LFC_hp)
+        
+# Order LFC results by adjusted P values
+res_LFC_hp_df <- as.data.frame(res_LFC_hp[order(res_LFC_hp$padj, na.last = NA), ])
+sum(res_LFC_hp_df$padj < 0.01, na.rm = TRUE)
+
+# Keep only KOs with adjusted p-value < 0.01
+res_LFC_hp_df <- res_LFC_hp_df[
+  res_LFC_hp_df$padj < 0.01 & !is.na(res_LFC_hp_df$padj), ]
+dim(res_LFC_hp_df)
+
+# Save File
+write.csv(res_LFC_hp, "DESeq2/Files/Results/Haptoglobin_InflamStat_full_model.csv")
+
+# Plots
+plotMA(res_hp, ylim = c(-30, 30))  # after DESeq2
+plotMA(res_LFC_hp, ylim = c(-30, 30))  # after Log2 Fold Change shrinkage
+```
+
+5.  Volcano plot
+
+```{r Hp_Volcano_plot}
+library(ggplot2)
+library(ggrepel)
+
+# Add threshold labels
+res_df <- res_LFC_hp_df
+res_df$significant <- ifelse(res_df$padj < 0.01 & abs(res_df$log2FoldChange) > 1,
+                             "Significant", "Not significant")
+
+# 10 top genes
+top_genes <- res_df[which(res_df$padj < 0.01 & abs(res_df$log2FoldChange) > 2), ]
+
+# Volcano plot
+ggplot(res_df, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = significant), alpha = 0.7, size = 2) +
+  scale_color_manual(values = c("Significant" = "red", "Not significant" = "gray")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.01), linetype = "dashed", color = "black") +
+  labs(title = "Haptoglobin KOs - Volcano Plot",
+       x = expression(Log[2]~Fold~Change),
+       y = expression(-Log[10]~Adjusted~p~value)) + geom_text_repel(data = top_genes,
+                  aes(label = rownames(top_genes)),
+                  size = 3, box.padding = 0.3, max.overlaps = 10) + theme_minimal(base_size = 14)
+```
+
+```{r}
+# Display table
+head(res_LFC_hp_df)
+```
+
+## Anotation of KOS - Haptoglobin
+
+```{r hp_annotation}
+library(KEGGREST)
+
+# KOs names:
+KOs_names_Haptoglobin <- rownames(res_LFC_hp_df)
+KOs_names_Haptoglobin <- gsub("ko:", "", KOs_names_Haptoglobin)
+res_LFC_hp_df$X <- KOs_names_Haptoglobin
+
+
+# Retrieve pathways for each KO
+names(KOs_names_Haptoglobin) <- KOs_names_Haptoglobin
+
+Haptoglobin_info <- lapply(KOs_names_Haptoglobin, function(ko) {
+  ko_entry <- tryCatch(keggGet(paste0("ko:", ko))[[1]], error = function(e) NULL)
+  ec_name <- if (!is.null(ko_entry) && !is.null(ko_entry$NAME)) ko_entry$NAME[1] else NA
+  
+  res <- tryCatch(keggLink("pathway", paste0("ko:", ko)), error = function(e) NULL)
+  if (!is.null(res) && length(res) > 0) {
+    path_ids <- sub("path:", "", res)
+    path_names <- sapply(path_ids, function(pid)
+      tryCatch(keggGet(pid)[[1]]$NAME, error = function(e) NA))
+    list(EC_name = ec_name, Pathway = unique(na.omit(path_names)))
+  } else {
+    list(EC_name = ec_name, Pathway = NA)
+  }
+})
+
+# Convert list to dataframe
+Haptoglobin_info_df <- do.call(rbind, lapply(Haptoglobin_info, function(x) {
+  # If multiple pathways, collapse into a single string separated by "; "
+  pathway <- if (is.na(x$Pathway[1])) NA else paste(x$Pathway, collapse = "; ")
+  data.frame(EC_name = x$EC_name, Pathway = pathway, stringsAsFactors = FALSE)
+}))
+
+#Update Data frame:
+rownames(Haptoglobin_info_df) <- names(KOs_names_Haptoglobin)
+
+Haptoglobin_merged <- cbind(res_LFC_hp_df,
+                            Haptoglobin_info_df[res_LFC_hp_df$X, ])
+
+write.csv(Haptoglobin_merged, "DESeq2/Files/Results/Haptoglobin_with_KEGG_info.csv")
+```
+
+```{r hp_annotation_table}
+head(Haptoglobin_merged)
+library(DT)
+
+res_df_hp <- Haptoglobin_merged
+res_df_hp$EC_name <- as.character(res_df_hp$EC_name)
+res_df_hp$Pathway <- as.character(res_df_hp$Pathway)
+
+colnames(res_df_hp)
+head(rownames(res_df_hp))
+
+if (!"KOs" %in% colnames(res_df_hp)) {
+  res_df_hp <- cbind(KOs = rownames(res_df_hp), res_df_hp)
+  rownames(res_df_hp) <- NULL
+}
+
+
+DT::datatable(
+  res_df_hp,
+  extensions = 'Buttons',
+  options = list(
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel', 'pdf'),
+    pageLength = 10,
+    lengthMenu = c(10, 15, 25, 50, 100),
+    scrollX = TRUE
+  ),
+  filter = 'top',
+  rownames = FALSE,
+  class = 'stripe hover compact'
+)
+
+```
+
+# Venn Diagram
+
+```{r venn, message=FALSE, warning=FALSE}
+library(VennDiagram)
+library(dplyr)
+padj_cutoff <- 0.01
+
+# Fibrinogen
+fibrinogen_up <- Fibrinogen_merged %>%
+  filter(padj < padj_cutoff, log2FoldChange > 2) %>%
+  pull(X) %>%
+  unique()
+
+fibrinogen_down <- Fibrinogen_merged %>%
+  filter(padj < padj_cutoff, log2FoldChange < 2) %>%
+  pull(X) %>%
+  unique()
+
+# Haptoglobin
+haptoglobin_up <- Haptoglobin_merged %>%
+  filter(padj < padj_cutoff, log2FoldChange > 2) %>%
+  pull(X) %>%
+  unique()
+
+haptoglobin_down <- Haptoglobin_merged %>%
+  filter(padj < padj_cutoff, log2FoldChange < 2) %>%
+  pull(X) %>%
+  unique()
+
+
+
+# Plot
+venn.plot <- venn.diagram(
+  x = list(
+    Fibrinogen_Up = fibrinogen_up,
+    Fibrinogen_Down = fibrinogen_down,
+    Haptoglobin_Up = haptoglobin_up,
+    Haptoglobin_Down = haptoglobin_down
+  ),
+  filename = NULL,
+  fill = c("#66c2a5", "#fc8d62", "#8da0cb", "#e78ac3"),
+  alpha = 0.6,
+  cex = 1.3,
+  cat.cex = 1.2,
+  cat.pos = 0,
+  cat.dist = 0.05,
+  margin = 0.1,
+  main = "Overlap of Significant KOs by Condition and Direction"
+)
+
+grid::grid.newpage()
+grid::grid.draw(venn.plot)
+```
