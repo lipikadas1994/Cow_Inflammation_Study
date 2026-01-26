@@ -1,0 +1,580 @@
+---
+title: "DG_DESeq2_Haptoglobin"
+author: "Slizovskiy Lab"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    fig_caption: true
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+# Base paths
+base_dir  <- path.expand("G:/Shared drives/Microbiome_Inflammation_Study/GABRIELA_DATA_FILES/Cow_Inflammation_Study/DESeq2_Haptoglobin")
+cache_dir <- file.path(base_dir, "Files", "Cache")
+fig_dir   <- file.path(base_dir, "Figures")
+
+# Create directories if they don't already exist
+dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir,   recursive = TRUE, showWarnings = FALSE)
+
+# Set knitr chunk options
+knitr::opts_chunk$set(
+  fig.keep       = "all",
+  fig.path       = paste0(fig_dir, "/"),   # must end with slash
+  dev = c("png", "svg"),        # <-- generate both PNG and SVG
+  dpi = 300,
+  cache          = TRUE,
+  cache.lazy     = FALSE,
+  cache.comments = FALSE,
+  cache.path     = paste0(cache_dir, "/"))  # must end with slash
+
+```
+
+## Load libraries, phyloseq object, metadata
+```{r libraries, message=FALSE, warning=FALSE}
+# Load Required Packages
+library(phyloseq)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(magrittr)
+library(tibble)
+library(microbiome)
+library(ANCOMBC) # v2.8.1
+library(lme4)
+library(DESeq2)
+library(EnhancedVolcano)
+library(ggplot2)
+library(pheatmap)
+library(circlize)
+library(ComplexHeatmap)
+
+
+# path.figures <- ":/Shared drives/Microbiome_Inflammation_Study/GABRIELA_DATA_FILES/Cow_Inflammation_Study/DESeq2_Haptoglobin/Figures/"
+path.rds <- "G:/Shared drives/Microbiome_Inflammation_Study/GABRIELA_DATA_FILES/Cow_Inflammation_Study"
+path.hapto <- file.path(path.rds, "DESeq2_Haptoglobin/")
+path.figures <- file.path(path.hapto, "Figures/")
+```
+
+```{r ps}
+# Load phyloseq
+ps <- readRDS(file.path(path.rds, "ps.st.decontam.feces.rds"))
+ps
+```
+
+```{r metadata}
+# Update metadata ===================================
+metadata <- read.csv(file.path(path.rds, "Updated_Cow_Metadata.csv"), 
+                     stringsAsFactors = FALSE)
+ps_samples <- sample_names(ps)
+metadata <- metadata[metadata$Sample_ID %in% ps_samples, ]
+rownames(metadata) <- metadata$Sample_ID
+metadata$Sample_ID <- NULL
+sample_data(ps) <- sample_data(metadata) # Assign metadata to the phyloseq obj
+
+# Rename ASVs  ========================================
+rename_asvs <- function(ps) {
+  old_names <- taxa_names(ps)
+  new_names <- paste0("ASV", seq_along(old_names))
+  
+  # Convert taxonomy to data frame
+  tax_df <- as.data.frame(tax_table(ps))
+  
+  # Remove existing Sequence column if it exists
+  if ("Sequence" %in% colnames(tax_df)) {
+    tax_df <- tax_df[, !colnames(tax_df) %in% "Sequence", drop = FALSE]
+  }
+  
+  # Add Sequence column at the beginning
+  tax_df <- cbind(Sequence = old_names, tax_df)
+  
+  # Reassign to phyloseq object
+  tax_table(ps) <- as.matrix(tax_df)
+  taxa_names(ps) <- new_names
+  
+  return(ps)
+}
+ps <- rename_asvs(ps)
+meta <- data.frame(sample_data(ps)) # Metadata after renaming
+
+# Modify metadata  ===================================
+meta$ExtractionDate <- as.Date(meta$ExtractionDate, format = "%m/%d/%Y")
+meta$ExtractionDate_cat <- factor(meta$ExtractionDate)
+
+meta$Parity_numeric <- as.numeric(as.character(meta$Parity))
+meta$Parity_Group <- factor(ifelse(meta$Parity_numeric <= 3,"Group1", "Group2"))
+
+meta$BCS <- as.numeric(as.character(meta$BCS))
+meta$BCS_Group <- factor(cut(meta$BCS,
+                             breaks = c(-Inf, 2.5, 3.5, Inf),
+                             labels = c("Low", "Medium", "High"),
+                             right = TRUE))
+
+meta$Haptoglobin_InflamStat <- factor(meta$Haptoglobin_InflamStat, 
+                                     levels = c("Normal", "Elevated"))
+meta$Haptoglobin_InflamStat<- relevel(meta$Haptoglobin_InflamStat, ref = "Normal")
+
+
+# Create Haptoglobin Mean column
+if (all(c("Haptoglobin_1DIM", "Haptoglobin_3DIM") %in% colnames(meta))) {
+  meta$Haptoglobin_Mean <- rowMeans(
+    meta[, c("Haptoglobin_1DIM", "Haptoglobin_3DIM")],
+    na.rm = TRUE
+  )} else if ("Haptoglobin_1DIM" %in% colnames(meta)) {
+  meta$Haptoglobin_Mean <- meta$Haptoglobin_1DIM
+} else {
+  stop("No Haptoglobin columns found in metadata")
+}
+
+# Make numeric
+meta$Haptoglobin_Mean <- as.numeric(meta$Haptoglobin_Mean)
+
+# Save Metadata
+write.csv(
+  meta,file.path(path.rds,
+            "meta_updated.csv"),
+  row.names = FALSE)
+
+# Re-assign metadata to the phyloseq object  ===========
+sample_data(ps) <- sample_data(meta)
+dim(sample_data(ps))
+
+# OTUs ==============================================
+if (taxa_are_rows(ps)) {
+  otu <- as(otu_table(ps), "matrix")   # already taxa x samples
+} else {
+  otu <- t(as(otu_table(ps), "matrix"))
+}
+
+# Align samples between counts and metadata
+meta <- data.frame(sample_data(ps))
+common_samples <- intersect(colnames(otu), rownames(meta))
+otu  <- otu[, common_samples]
+meta <- meta[common_samples, ]
+
+# Check dimensions
+cat("Samples in counts:", ncol(otu), "\n")
+cat("Samples in metadata:", nrow(meta), "\n")
+```
+
+## DESeq2 handling zeros
+
+```{r deseq}
+dds <- DESeqDataSetFromMatrix(
+  countData = otu,
+  colData   = meta,
+  design    = ~ Haptoglobin_InflamStat + BCS_Group + Parity_Group + ExtractionDate_cat)
+
+dds
+dds$meta <- relevel(dds$Haptoglobin_InflamStat, ref = "Normal")
+dds <- estimateSizeFactors(dds, type = "poscounts")
+
+print("Size factors calculated:")
+head(sizeFactors(dds))
+```
+
+Run DESeq2
+
+```{r dds}
+#dds <- DESeq(dds)
+#saveRDS(dds, file.path(path.rds, "DeSeq2_Haptoglobin/Files/DESeq_dds_Haptoglobin.rds"))
+dds <- readRDS(file.path(path.rds, "DeSeq2_Haptoglobin/Files/DESeq_dds_Haptoglobin.rds"))
+dds
+
+# Dispersion estimation
+#dds_Haptoglobin_dispersion <- estimateDispersions(dds)
+#saveRDS(dds_Haptoglobin_dispersion, file.path(path.rds, "DeSeq2_Haptoglobin/Files/DESeq_dds_Haptoglobin_dispersion.rds"))
+dds_Haptoglobin_dispersion <- readRDS(file.path(path.rds, "DeSeq2_Haptoglobin/Files/DESeq_dds_Haptoglobin_dispersion.rds"))
+plotDispEsts(dds)
+```
+Extract results:
+```{r dds_results}
+# Get results (change contrast to your comparison)
+alpha <- 0.01
+resultsNames(dds)
+res<- results(dds, alpha = alpha, name = "Haptoglobin_InflamStat_Elevated_vs_Normal")
+summary(res)
+
+```
+
+```{r sig_res_hp}
+# Make dataframe with taxonomy
+res_df <- as.data.frame(res) %>%
+  rownames_to_column("ASV") %>%
+  filter(!is.na(padj)) %>%
+  arrange(padj)
+
+# Add taxonomy
+taxa_names(ps) <- paste0("ASV", seq_along(taxa_names(ps)))
+tax_df <- as.data.frame(tax_table(ps)) %>%
+  rownames_to_column("ASV")
+res_df <- left_join(res_df, tax_df, by = "ASV")
+res_df <- res_df %>%
+  select(-matches("\\.(x|y)$"), 
+         -Kingdom, -Phylum, -Class, -Order, -Family, -Genus, -Species)
+res_df <- left_join(res_df, tax_df, by = "ASV")
+res_df <- res_df %>%  mutate(Genus = ifelse(is.na(Genus) | Genus == "",  paste0("Uncharacterized:", Family), Genus))
+
+# Significant results
+sig_res <- filter(res_df, padj < 0.01)
+sig_res <- sig_res[rowSums(otu[sig_res$ASV, ]) > 0, ]  # Remove zero-sum taxa
+
+print(paste("Significant taxa:", nrow(sig_res)))
+
+# Sort by p-value:
+sig_res_sorted <- sig_res[order(sig_res$padj,
+                                -abs(sig_res$log2FoldChange)), ]
+
+# Check
+head(sig_res_sorted, 20)
+summary(sig_res_sorted)
+
+# Save
+write.csv(sig_res_sorted,
+  file.path(path.hapto, "Files/result_Haptoglobin_annotated_sorted.csv"),
+  row.names = FALSE)
+
+
+```
+## Normalize by qPCR 16S load
+```{r normalization_hp}
+# Make dataframe of significant ASVs
+sig_asvs <- sig_res$ASV
+otu_sig <- otu[sig_asvs, , drop = FALSE]
+otu_sig <- otu_sig[, rownames(meta)]
+
+
+# Normalize abundance by dividing by qPCR copies per ASV 
+# Extract qPCR 16S load
+meta$qpcr_16s_copies_ul <- gsub(",", "", meta$qpcr_16s_copies_ul)
+meta$qpcr_16s_copies_ul <- as.numeric(meta$qpcr_16s_copies_ul)
+qpcr_16s <- meta$qpcr_16s_copies_ul
+names(qpcr_16s) <- rownames(meta)
+qpcr_16s <- qpcr_16s[colnames(otu_sig)]
+
+# normalize 
+normalized_abundance <- sweep(otu_sig, 2, qpcr_16s, FUN = "/")
+```
+
+## Correlation between ASV abundance and Haptoglobin
+```{r correlations_hp}
+# Regression between concentration and inflammation
+# Make numeric
+meta$Haptoglobin_Mean <- as.numeric(meta$Haptoglobin_Mean)
+
+# Keep only samples with qPCR and Haptoglobin data
+keep_samples <- !is.na(meta$qpcr_16s_copies_ul) & !is.na(meta$Haptoglobin_Mean)
+meta <- meta[keep_samples, ]
+
+# Spearman correlation with continuous Haptoglobin
+Haptoglobin_cor_results <- lapply(rownames(normalized_abundance), function(asv) {
+  
+  x <- as.numeric(normalized_abundance[asv, ])
+  y <- meta$Haptoglobin_Mean
+  
+  res <- cor.test(x, y, method = "spearman", exact = FALSE)
+  
+  data.frame(
+    ASV = asv,
+    Spearman_rho = unname(res$estimate),
+    p_value = res$p.value)})
+
+# Combine results into a data frame
+Haptoglobin_cor_df <- bind_rows(Haptoglobin_cor_results)
+
+# Merge correlation
+Haptoglobin_cor_annotated <- Haptoglobin_cor_df %>%
+  left_join(res_df, by = "ASV") %>%
+  left_join(tax_df, by = "ASV")
+
+
+# Adjust P values
+Haptoglobin_cor_annotated <- Haptoglobin_cor_annotated %>%
+  mutate( cor_padj = p.adjust(p_value, method = "BH")) #Control the False Discovery Rate (FDR) using Benjamini–Hochberg (BH)
+
+# Edit table
+Haptoglobin_cor_annotated <- Haptoglobin_cor_annotated %>% 
+  select(
+    ASV,
+    Spearman_rho,
+    lfcSE,
+    stat, 
+    p_value, 
+    padj, 
+    cor_padj,
+    log2FoldChange,
+    baseMean,
+    ends_with(".x")
+  ) %>% 
+  rename_with(~ sub("\\.x$", "", .x), ends_with(".x"))
+
+# Save results
+write.csv(
+  Haptoglobin_cor_annotated, file.path(path.hapto,
+            "Files/Haptoglobin_Spearman_DESeq_Annotated.csv"),
+  row.names = FALSE)
+
+```
+
+```{r ASVs_to_plot_hp}
+# Identify ASVs of interest (example filter)
+Haptoglobin_cor_annotated <- read.csv(file.path(path.rds,
+    "DeSeq2_Haptoglobin/Files/Haptoglobin_Spearman_DESeq_Annotated.csv"),
+    header = TRUE)
+  
+Haptoglobin_hits <- Haptoglobin_cor_annotated %>%
+  filter(abs(Spearman_rho) > 0.2, padj < 0.01) %>%  
+  arrange(desc(abs(Spearman_rho))) 
+
+# Top ASVs by absolute rho
+top_hits <- Haptoglobin_hits[order(-abs(Haptoglobin_hits$Spearman_rho)), ]
+asvs_to_plot <- top_hits %>%  select(ASV, Genus) %>%  distinct()
+asvs_to_plot <- asvs_to_plot[asvs_to_plot$ASV %in% rownames(normalized_abundance), ]
+asvs_to_plot
+
+# Save results
+write.csv(
+  asvs_to_plot,file.path(path.rds,
+            "DeSeq2_Haptoglobin/Files/Haptoglobin_asvs_to_plot.csv"),
+  row.names = FALSE)
+```
+## Plots
+### Barplot
+```{r Barplots_hp}
+# barplot significant taxa by log2FoldChange ------------------------
+barplot.df <- sig_res_sorted %>%
+  arrange(desc(abs(log2FoldChange))) %>%
+  mutate(
+    Taxa  = reorder(ASV, log2FoldChange),
+    Genus = ifelse(is.na(Genus) | Genus == "",  paste0("Uncharacterized:", Family), Genus))
+
+label_asvs <- unique(asvs_to_plot$ASV)
+y_labels <- setNames(
+  ifelse( barplot.df$ASV %in% label_asvs,
+          paste0(barplot.df$ASV, " (", barplot.df$Genus, ")"),""),  barplot.df$ASV)
+
+# Plot
+barplot <- ggplot(barplot.df, aes(x = log2FoldChange, y = Taxa)) +
+  geom_col(aes(fill = log2FoldChange), position = "identity") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red") +
+  geom_text(
+    data = dplyr::filter(barplot.df, ASV %in% label_asvs),
+    aes(x = 0, y = Taxa, label = paste0("*", ASV, " (", Genus, ")")),
+    hjust = 0,  vjust=0,   size = 3 ) +
+  scale_y_discrete(labels = y_labels) +
+  scale_x_continuous(
+    breaks = function(x) seq(
+      from = floor(min(x, na.rm = TRUE) / 10) * 10,
+      to   = ceiling(max(x, na.rm = TRUE) / 10) * 10,
+      by   = 10)) +
+  theme_bw() +
+  labs(title = "Differentially Abundant Taxa with Haptoglobin") +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(), 
+    legend.position = "bottom"
+  )
+barplot
+```
+
+### Heatmap of correlations
+```{r heatmap}
+
+# Keep same order as the Barplot
+ht.cor.estimate.ord <- Haptoglobin_cor_annotated %>%
+  mutate( is_hit = ASV %in% Haptoglobin_hits$ASV) %>%
+  arrange(desc(log2FoldChange)) %>%
+  mutate(ASV = factor(ASV, levels = ASV))
+
+# Heatmap matrix
+mat <- ht.cor.estimate.ord %>%
+  select(Spearman_rho) %>%
+  as.matrix()
+rownames(mat) <- ht.cor.estimate.ord$ASV
+
+# Label significant correlations
+sig_mat <- ht.cor.estimate.ord %>%
+  mutate(star = ifelse(is_hit, "*", "")) %>%
+  select(star) %>%
+  as.matrix()
+
+rownames(sig_mat) <- ht.cor.estimate.ord$ASV
+colnames(sig_mat) <- colnames(mat)
+
+# Plot settings
+rho_lim <- max(abs(ht.cor.estimate.ord$Spearman_rho), na.rm = TRUE)
+col_fun <- colorRamp2(c(-rho_lim, 0, rho_lim), c("blue", "white", "red"))
+
+ht_plot <- Heatmap(
+  mat,
+  name = "Spearman ρ",
+  col = col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_column_names = FALSE,
+  show_row_names = FALSE,
+  row_title = NULL,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    if (sig_mat[i, j] == "*") {
+      grid.text("*", x, y, gp = gpar(fontsize = 5, fontface = "bold"))
+      grid.text(
+        rownames(mat)[i],
+        x + unit(0.6, "mm"),
+        y,
+        just = "left",
+        gp = gpar(fontsize = 5)
+      )
+    }
+  }
+)
+ht_plot
+```
+
+```{r Hp_Final_plot}
+### Combine plots -------------------------------
+# Barplot + Heatmap
+ht_grob <- grid.grabExpr(ComplexHeatmap::draw(
+    ht_plot, heatmap_legend_side = "bottom",
+    padding = unit(c(0, 0, 0, 0), "mm")))
+
+ht_plot <- wrap_elements(full = ht_grob)
+
+final_plot <- barplot + ht_plot +
+  plot_layout(widths = c(4, 1), guides = "collect") &
+  theme(legend.position = "bottom")
+
+ggsave(
+  filename = "Fig_4_Haptoglobin_DESeq2_Barplot_Heatmap.svg",
+  plot = final_plot,  
+  path = file.path(path.figures),
+  width = 10,   height = 10,   dpi = 300 )
+```
+
+
+
+### Individual correlation plots
+```{r correlation_plots}
+# Function to get taxon label (Genus or Class)
+get_tax_label <- function(asv) {
+  g <- tax[asv, "Genus"]
+  c <- tax[asv, "Class"]
+
+  if (!is.na(g) && g != "") {
+    return(g)} 
+  else if (!is.na(c) && c != "") {return(paste0("Class: ", c))}
+  else {return("Taxon: Unknown")}
+}
+
+# Get Plots
+plot_list <- list()
+for (i in seq_len(nrow(Haptoglobin_hits))) {
+  
+  # Extract ASV and genus
+  asv <- Haptoglobin_hits$ASV[i]
+  tax_label <- Haptoglobin_hits$Genus[i]
+  
+  # Fallback for missing taxonomy
+  if (is.na(tax_label) || tax_label == "") {
+    tax_label <- "Unclassified"
+  }
+  
+  # Prepare data for plotting
+  df_plot <- data.frame(
+    Abundance = as.numeric(normalized_abundance[asv, ]),
+    Haptoglobin = meta$Haptoglobin_Mean  )
+  
+  # Remove zero-inflated samples for THIS ASV
+  df_plot <- df_plot[df_plot$Abundance > 0, ]
+  
+  # correlation values
+  rho  <- top_hits$Spearman_rho[top_hits$ASV == asv]
+  pval <- top_hits$p_value[top_hits$ASV == asv]
+  
+  # Build the title: ASV + Taxon Name
+  plot_title <- paste0(asv, " (", tax_label, ")")
+  
+  p <- ggplot(df_plot, aes(x = Haptoglobin, y = Abundance)) +
+    geom_point(size = 4, alpha = 0.7) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 0.8, color = "black") +
+    labs(
+      title = bquote(.(asv) ~ "(" * italic(.(tax_label)) * ")"),
+      x = "Haptoglobin Mean",
+      y = "Normalized Abundance") +
+    annotate( "text", x = -Inf, y = Inf,label = deparse(
+      bquote(rho == .(round(rho, 3)) ~
+               "|" ~ italic(p) == .(signif(pval, 3)))),
+      parse = TRUE, hjust = -0.05, vjust = 1.2, size = 3.5) +
+    theme_minimal(base_size = 12)+
+    theme(panel.border = element_rect(color = "black", 
+                                      fill = NA, linewidth = 0.8))
+  
+  plot_list[[asv]] <- p
+
+
+# Save
+ ggsave(
+    filename = file.path(path.figures, paste0("correlation_", asv, ".svg")),
+    plot = p, width = 6, height = 5,  dpi= 300  )}
+```
+
+
+### Log2 Fold Change Shrinkage
+```{r}
+# Log2 Fold Change Shrink
+res_LFC_fb <- lfcShrink(dds, 
+                         type = "ashr", 
+                         res = res)
+
+# Filter for significant results
+res_LFC_fb <- res_LFC_fb[which(res_LFC_fb$padj < 0.01 & 
+                               abs(res_LFC_fb$log2FoldChange) > 2), ]
+summary(res_LFC_fb)
+
+# Order LFC results by adjusted P values
+res_LFC_fb_df <- as.data.frame(res_LFC_fb[order(res_LFC_fb$padj, na.last = NA), ])
+sum(res_LFC_fb_df$padj < 0.01, na.rm = TRUE)
+
+# Keep only KOs with adjusted p-value < 0.01
+res_LFC_fb_df <- res_LFC_fb_df[
+  res_LFC_fb_df$padj < 0.01 & !is.na(res_LFC_fb_df$padj), ]
+dim(res_LFC_fb_df)
+0
+```
+
+```{r}
+head(res_LFC_fb_df)
+library(reactable)
+library(DT)
+
+res_df <- res_LFC_fb_df
+if (!"KOs" %in% colnames(res_df)) {
+res_df <- cbind(KOs = rownames(res_df), res_df)
+rownames(res_df) <- NULL
+}
+
+datatable(
+res_df,
+extensions = c('Buttons', 'Responsive', 'Scroller'),
+options = list(
+dom = 'Bfrtip', # show buttons, filter, table
+buttons = c('copy', 'csv', 'excel', 'pdf'),
+pageLength = 15,
+lengthMenu = c(10, 15, 25, 50, 100),
+scrollX = TRUE,
+scrollY = "400px",
+deferRender = TRUE,
+scroller = TRUE
+),
+filter = 'top',
+rownames = FALSE,
+class = 'stripe hover compact'
+)
+```
+
