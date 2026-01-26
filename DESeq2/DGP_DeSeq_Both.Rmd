@@ -1,0 +1,691 @@
+---
+title: "DG_DESeq2_Fibrinogen_And_Haptoglobin"
+author: "Slizovskiy Lab"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    fig_caption: true
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+# Base paths
+base_dir  <- path.expand("G:/Shared drives/Microbiome_Inflammation_Study/GABRIELA_DATA_FILES/Cow_Inflammation_Study/DESeq2_Both")
+cache_dir <- file.path(base_dir, "Files", "Cache")
+fig_dir   <- file.path(base_dir, "Figures")
+
+# Create directories if they don't already exist
+dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir,   recursive = TRUE, showWarnings = FALSE)
+
+# Set knitr chunk options
+knitr::opts_chunk$set(
+  fig.keep       = "all",
+  fig.path       = paste0(fig_dir, "/"),   # must end with slash
+  dev = c("png", "svg"),        # <-- generate both PNG and SVG
+  dpi = 300,
+  cache          = TRUE,
+  cache.lazy     = FALSE,
+  cache.comments = FALSE,
+  cache.path     = paste0(cache_dir, "/")
+  )  # must end with slash
+
+```
+
+## Load libraries, phyloseq object, metadata
+
+```{r message=FALSE, warning=FALSE}
+# Load Required Packages
+library(phyloseq)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(magrittr)
+library(tibble)
+library(microbiome)
+library(ANCOMBC) # v2.8.1
+library(lme4)
+library(DESeq2)
+library(EnhancedVolcano)
+library(ggplot2)
+library(pheatmap)
+library(patchwork)
+library(ComplexHeatmap)
+library(circlize)
+
+
+path.rds <- "G:/Shared drives/Microbiome_Inflammation_Study/GABRIELA_DATA_FILES/Cow_Inflammation_Study"
+path.both <- file.path(path.rds, "DESeq2_Both/")
+path.figures <- file.path(path.both, "Figures/")
+
+```
+
+```{r}
+# Load phyloseq
+ps <- readRDS(file.path(path.rds, "ps.st.decontam.rds"))
+ps_feces <- subset_samples(ps, Sample_Type == "Feces")
+ps_feces
+saveRDS(ps_feces, file.path(path.rds, "ps.st.decontam.feces.rds"))
+ps <- ps_feces
+ps
+```
+
+```{r metadata}
+# Update metadata ===================================
+metadata <- read.csv(file.path(path.rds, "Updated_Cow_Metadata.csv"), 
+                     stringsAsFactors = FALSE)
+ps_samples <- sample_names(ps)
+metadata <- metadata[metadata$Sample_ID %in% ps_samples, ]
+rownames(metadata) <- metadata$Sample_ID
+metadata$Sample_ID <- NULL
+sample_data(ps) <- sample_data(metadata) # Assign metadata to the phyloseq obj
+
+# Rename ASVs  ========================================
+rename_asvs <- function(ps) {
+  old_names <- taxa_names(ps)
+  new_names <- paste0("ASV", seq_along(old_names))
+  
+  # Convert taxonomy to data frame
+  tax_df <- as.data.frame(tax_table(ps))
+  
+  # Remove existing Sequence column if it exists
+  if ("Sequence" %in% colnames(tax_df)) {
+    tax_df <- tax_df[, !colnames(tax_df) %in% "Sequence", drop = FALSE]
+  }
+  
+  # Add Sequence column at the beginning
+  tax_df <- cbind(Sequence = old_names, tax_df)
+  
+  # Reassign to phyloseq object
+  tax_table(ps) <- as.matrix(tax_df)
+  taxa_names(ps) <- new_names
+  
+  return(ps)
+}
+ps <- rename_asvs(ps)
+meta <- data.frame(sample_data(ps)) # Metadata after renaming
+
+# Modify metadata  ===================================
+meta$ExtractionDate <- as.Date(meta$ExtractionDate, format = "%m/%d/%Y")
+meta$ExtractionDate_cat <- factor(meta$ExtractionDate)
+
+meta$Parity_numeric <- as.numeric(as.character(meta$Parity))
+meta$Parity_Group <- factor(ifelse(meta$Parity_numeric <= 3,"Group1", "Group2"))
+
+meta$BCS <- as.numeric(as.character(meta$BCS))
+meta$BCS_Group <- factor(cut(meta$BCS,
+                             breaks = c(-Inf, 2.5, 3.5, Inf),
+                             labels = c("Low", "Medium", "High"),
+                             right = TRUE))
+
+meta$Fibrinogen_InflamStat <- factor(meta$Fibrinogen_InflamStat, 
+                                     levels = c("Normal", "Elevated"))
+meta$Fibrinogen_InflamStat<- relevel(meta$Fibrinogen_InflamStat, ref = "Normal")
+
+
+meta$Haptoglobin_InflamStat <- factor(meta$Haptoglobin_InflamStat, levels = c("Normal", "Elevated"))
+meta$Haptoglobin_InflamStat <- relevel(meta$Haptoglobin_InflamStat, ref = "Normal")
+
+# Create Haptoglobin Mean column
+if (all(c("Haptoglobin_1DIM", "Haptoglobin_3DIM") %in% colnames(meta))) {
+  meta$Haptoglobin_Mean <- rowMeans(
+    meta[, c("Haptoglobin_1DIM", "Haptoglobin_3DIM")],
+    na.rm = TRUE
+  )} else {
+  stop("No Haptoglobin columns found in metadata")
+}
+
+# Make numeric
+meta$Haptoglobin_Mean <- as.numeric(meta$Haptoglobin_Mean)
+
+# Re-assign metadata to the phyloseq object  ===========
+sample_data(ps) <- sample_data(meta)
+dim(sample_data(ps))
+
+# OTUs ==============================================
+if (taxa_are_rows(ps)) {
+  otu <- as(otu_table(ps), "matrix")   # already taxa x samples
+} else {
+  otu <- t(as(otu_table(ps), "matrix"))
+}
+
+# Align samples between counts and metadata
+meta <- data.frame(sample_data(ps))
+common_samples <- intersect(colnames(otu), rownames(meta))
+otu  <- otu[, common_samples]
+meta <- meta[common_samples, ]
+
+# Check dimensions
+cat("Samples in counts:", ncol(otu), "\n")
+cat("Samples in metadata:", nrow(meta), "\n")
+```
+
+## DESeq2 handling zeros
+
+```{r}
+dds <- DESeqDataSetFromMatrix(
+  countData = otu,
+  colData   = meta,
+  design    = ~ Haptoglobin_InflamStat + Fibrinogen_InflamStat + BCS_Group + Parity_Group + ExtractionDate_cat)
+
+dds
+dds$meta <- relevel(dds$Fibrinogen_InflamStat, ref = "Normal")
+dds$meta <- relevel(dds$Haptoglobin_InflamStat, ref = "Normal")
+dds <- estimateSizeFactors(dds, type = "poscounts")
+
+print("Size factors calculated:")
+head(sizeFactors(dds))
+```
+
+
+Run DESeq2
+
+```{r}
+#dds <- DESeq(dds)
+#saveRDS(dds, file.path(path.rds, "DeSeq2_Both/Files/DESeq_dds_Fibrino.rds"))
+dds <- readRDS(file.path(path.rds, "DeSeq2_Both/Files/DESeq_dds_Fibrino.rds"))
+dds
+
+# Dispersion estimation
+# dds_both_dispersion <- estimateDispersions(dds)
+# saveRDS(dds_both_dispersion, file.path(path.rds, "DeSeq2_Both/Files/dds_both_dispersion.rds"))
+dds_both_dispersion <- readRDS(file.path(path.rds, "DeSeq2_Both/Files/dds_both_dispersion.rds"))
+plotDispEsts(dds)
+```
+
+Extract results:
+
+```{r}
+# Get results (change contrast to your comparison)
+alpha <- 0.01
+resultsNames(dds)
+res<- results(dds, alpha = alpha)
+summary(res)
+
+```
+
+```{r sig_taxa}
+# Make dataframe with taxonomy
+res_df <- as.data.frame(res) %>%
+  rownames_to_column("ASV") %>%
+  filter(!is.na(padj)) %>%
+  arrange(padj)
+
+# Add taxonomy
+tax_df <- as.data.frame(tax_table(ps)) %>%
+  rownames_to_column("ASV")
+res_df <- left_join(res_df, tax_df, by = "ASV")
+# res_df <- res_df %>% select(-ends_with(".x"), -ends_with(".y"))
+res_df <- res_df %>%  mutate(Genus = ifelse(is.na(Genus) | Genus == "",  paste0("Uncharacterized:", Family), Genus))
+
+
+# Significant results
+sig_res <- filter(res_df, padj < 0.01)
+sig_res <- sig_res[rowSums(otu[sig_res$ASV, ]) > 0, ]  # Remove zero-sum taxa
+
+print(paste("Significant taxa:", nrow(sig_res)))
+
+# Sort by p-value:
+sig_res_sorted <- sig_res[order(sig_res$padj, -abs(sig_res$log2FoldChange)), ]
+
+# Check
+head(sig_res_sorted, 20)
+summary(sig_res_sorted)
+
+# Save
+write.csv(sig_res_sorted,
+  file.path(path.rds, "DeSeq_Fibrinogen/Files/result_both_annotated_sorted.csv"),
+  row.names = FALSE)
+
+```
+
+Normalization using qPCR number
+```{r normalization_by_qPCR}
+# Make dataframe of significant ASVs
+sig_asvs <- sig_res$ASV
+otu_sig <- otu[sig_asvs, , drop = FALSE]
+
+# Ensure same sample order
+otu_sig <- otu_sig[, rownames(meta)]
+
+# Extract qPCR 16S load
+meta$qpcr_16s_copies_ul <- gsub(",", "", meta$qpcr_16s_copies_ul)
+meta$qpcr_16s_copies_ul <- as.numeric(meta$qpcr_16s_copies_ul)
+qpcr_16s <- meta$qpcr_16s_copies_ul
+names(qpcr_16s) <- rownames(meta)
+qpcr_16s <- qpcr_16s[colnames(otu_sig)]
+
+# Normalize abundance by dividing by qPCR copies per ASV
+normalized_abundance <- sweep(otu_sig, 2, qpcr_16s, FUN = "/")
+```
+
+## Correlation between ASV abundance and both markers
+
+```{r correlation_marker_abundance}
+# Regression between concentration and inflammation
+
+# Ensure Fibrinogen is numeric
+meta$FIBRINOGEN_MEAN <- as.numeric(meta$FIBRINOGEN_MEAN)
+meta$Haptoglobin_Mean <- as.numeric(meta$Haptoglobin_Mean)
+
+# Keep only samples with qPCR and fibrinogen data
+keep_samples <- !is.na(meta$qpcr_16s_copies_ul) & !is.na(meta$FIBRINOGEN_MEAN)
+meta <- meta[keep_samples, ]
+
+# Spearman correlation with continuous fibrinogen
+fibrino_cor_results <- lapply(rownames(normalized_abundance), function(asv) {
+  
+  x <- as.numeric(normalized_abundance[asv, ])
+  y <- meta$FIBRINOGEN_MEAN
+  
+  res <- cor.test(x, y, method = "spearman", exact = FALSE)
+  
+  data.frame(
+    ASV = asv,
+    fb_Spearman_rho = unname(res$estimate),
+    fb_p_value = res$p.value)})
+
+# Spearman correlation with continuous Haptoglobin
+Haptoglobin_cor_results <- lapply(rownames(normalized_abundance), function(asv) {
+  
+  x <- as.numeric(normalized_abundance[asv, ])
+  y <- meta$Haptoglobin_Mean
+  
+  res <- cor.test(x, y, method = "spearman", exact = FALSE)
+  
+  data.frame(
+    ASV = asv,
+    hp_Spearman_rho = unname(res$estimate),
+    hp_p_value = res$p.value)})
+
+# Combine results into a data frame
+fibrino_cor_df <- bind_rows(fibrino_cor_results)
+Haptoglobin_cor_df <- bind_rows(Haptoglobin_cor_results )
+both_cor_df <- fibrino_cor_df %>% inner_join(Haptoglobin_cor_df, by = "ASV")
+
+# Add the DA results: Log2FoldChange
+both_cor_df <- both_cor_df %>% left_join(
+  res_df %>% select(ASV, log2FoldChange), by = "ASV")
+
+# Create the label: Elevated or Normal according the Log2FoldChange
+both_cor_df <- both_cor_df %>%
+  mutate(
+    Inflammation = case_when(
+      log2FoldChange > 0 ~ "Elevated",
+      log2FoldChange < 0 ~ "Normal",
+      TRUE               ~ "Non_significant"))
+
+# Significant correlations
+sum(both_cor_df$fb_p_value < 0.01, na.rm = TRUE)
+sum(both_cor_df$hp_p_value < 0.01, na.rm = TRUE)
+Both_cor_annotated <- both_cor_df 
+
+# Merge correlation
+Both_cor_annotated <- Both_cor_annotated %>% left_join(res_df, by = "ASV")
+
+# Save results
+write.csv(
+  Both_cor_annotated,file.path(path.both, "Files/Both_Spearman_DESeq_Annotated.csv"),row.names = FALSE)
+
+
+```
+
+```{r ASV_to_plot}
+# Identify ASVs of interest (example filter)
+Both_cor_annotated <- read.csv(file.path(path.both,   "Files/Both_Spearman_DESeq_Annotated.csv"),header = TRUE)
+  
+Both_hits <- Both_cor_annotated %>%
+  filter(
+    (abs(fb_Spearman_rho) > 0.2 & fb_p_value < 0.01) |
+    (abs(hp_Spearman_rho) > 0.2 & hp_p_value < 0.01)) %>%
+  arrange(desc(abs(hp_Spearman_rho)))
+
+head(Both_hits)
+
+## Get a small dataframe of Both_hits: only ASV, Spearman_rho, p_value
+Both_cor_df <- as.data.frame(Both_hits) # Ensure base data.frame
+Both_cor_df$fb_Spearman_rho <- as.numeric(Both_cor_df$fb_Spearman_rho)
+Both_cor_df$hp_Spearman_rho <- as.numeric(Both_cor_df$hp_Spearman_rho)
+Both_cor_df$fb_p_value     <- as.numeric(Both_cor_df$fb_p_value)
+Both_cor_df$hp_p_value     <- as.numeric(Both_cor_df$hp_p_value)
+
+
+# Top ASVs by absolute rho
+top_hits <- Both_cor_df[order(-abs(Both_cor_df$fb_Spearman_rho)), ]
+top_hits <- top_hits  %>%  mutate(ASV_label = paste0(ASV, " (", Genus, ")"))
+top_hits <- top_hits %>%
+  mutate(
+    Significant = case_when(
+      fb_p_value < 0.01 & hp_p_value < 0.01 ~ "both_significant",
+      fb_p_value < 0.01 ~ "Fibrinogen",
+      hp_p_value < 0.01 ~ "Haptoglobin",
+      TRUE             ~ "Non_significant"))
+
+asvs_to_plot <- top_hits %>%  select(ASV, Genus, Significant, Inflammation) %>%  distinct()
+asvs_to_plot <- asvs_to_plot[asvs_to_plot$ASV %in% rownames(normalized_abundance), ]
+asvs_to_plot
+
+# Save results
+write.csv(
+  asvs_to_plot,file.path(path.rds,
+            "DeSeq2_Both/Files/Both_asvs_to_plot.csv"),
+  row.names = FALSE)
+```
+
+## Plots
+### Barplot
+
+```{r barplot}
+# barplot significant taxa by log2FoldChange ------------------------
+barplot.df <- Both_cor_annotated %>%
+  arrange(desc(abs(log2FoldChange.x))) %>%
+  mutate(
+    Taxa = reorder(ASV, log2FoldChange.x),
+    Genus = ifelse(is.na(Genus) | Genus == "",  paste0("Uncharacterized:", Family), Genus))
+
+label_asvs <- unique(asvs_to_plot$ASV)
+
+y_labels <- setNames(
+  ifelse(
+    barplot.df$ASV %in% label_asvs,
+    paste0(barplot.df$ASV, " (", barplot.df$Genus, ")"),
+    ""),  barplot.df$ASV)
+
+
+barplot <- ggplot(barplot.df, aes(x = log2FoldChange.x, y = Taxa)) +
+  geom_col(aes(fill = log2FoldChange.x), position = "identity") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red") +
+  geom_text(
+    data = dplyr::filter(barplot.df, ASV %in% label_asvs),
+    aes(x = 0, y = Taxa, label = paste0("*", ASV, " (", Genus, ")")),
+    hjust = 0,  vjust=0,   size = 3 ) +
+  scale_y_discrete(labels = y_labels) +
+  scale_x_continuous(
+    breaks = function(x) seq(
+      from = floor(min(x, na.rm = TRUE) / 10) * 10,
+      to   = ceiling(max(x, na.rm = TRUE) / 10) * 10,
+      by   = 10)) +
+  theme_bw() +
+  labs(title = "Differentially Abundant Taxa by Fibrinogen and Haptoglobin") +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(), 
+    legend.position = "bottom"
+  )
+
+barplot
+
+
+```
+
+### Heatmap
+
+```{r Heatmap}
+order <- sig_res_sorted %>%
+  arrange(desc(log2FoldChange)) %>% pull(ASV)
+
+cor.estimate.ord <- Both_cor_annotated %>%
+  filter(ASV %in% order) %>%   # only ASVs in barplot
+  mutate(
+    ASV = factor(ASV, levels = order),  # force the desired order
+    is_hit = ASV %in% Both_hits$ASV,
+    fb_sig = fb_p_value < 0.01,
+    hp_sig = hp_p_value < 0.01
+  ) %>%  arrange(ASV)
+
+mat <- cor.estimate.ord %>%
+  select(fb_Spearman_rho, hp_Spearman_rho) %>%
+  as.matrix()
+
+sig_mat <- cor.estimate.ord %>%
+  select(fb_sig, hp_sig) %>%
+  mutate(
+    fb_sig = ifelse(fb_sig, "*", ""),
+    hp_sig = ifelse(hp_sig, "*", "")
+  ) %>%
+  as.matrix()
+
+rownames(mat)     <- as.character(cor.estimate.ord$ASV)
+rownames(sig_mat) <- rownames(mat)
+colnames(sig_mat) <- colnames(mat)
+
+estimate.max.fb <- Both_cor_annotated %>% 
+  filter(!is.na(fb_Spearman_rho)) %>% 
+  .$fb_Spearman_rho %>% 
+  abs() %>% 
+  max() %>% 
+  round(digits = 2)
+
+estimate.max.hp <- Both_cor_annotated %>% 
+  filter(!is.na(hp_Spearman_rho)) %>% 
+  .$hp_Spearman_rho %>% 
+  abs() %>% 
+  max() %>% 
+  round(digits = 2)
+
+rho_lim <- max(estimate.max.fb, estimate.max.hp)
+col_fun <- colorRamp2(c(-rho_lim, 0, rho_lim),c("blue", "white", "red"))
+
+col_labels <- c("Fb", "Hp")
+
+# Create a top annotation with the column names
+top_ann <- HeatmapAnnotation(
+  Biomarker = anno_text(col_labels, 
+                        rot = 0,            # horizontal text
+                        gp = gpar(fontsize = 10, fontface = "bold"))
+)
+
+# Heatmap
+ht <- Heatmap(
+  mat,
+  name = "Spearman ρ",
+  col = col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_column_names = FALSE,   # remove x labels
+  show_row_names = FALSE,      # remove y labels
+  top_annotation = top_ann,
+  row_title = NULL,            # remove row title,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+
+    if (sig_mat[i, j] == "*") {
+      # draw star
+      grid.text("*", x, y, gp = gpar(fontsize = 5, fontface = "bold"))
+      # draw ASV name slightly to the right of the star
+      grid.text(
+        rownames(mat)[i],
+        x + unit(0.6, "mm"),
+        y,
+        just = "left",
+        gp = gpar(fontsize = 5)
+      )
+    }
+  }
+)
+
+ht
+
+
+```
+
+
+
+### Combine Barplot and Heatmap
+
+```{r final_plot}
+# Barplot + Heatmap
+ht_grob <- grid.grabExpr(ComplexHeatmap::draw(
+    ht, heatmap_legend_side = "bottom",
+    padding = unit(c(0, 0, 0, 0), "mm")))
+
+ht_plot <- wrap_elements(full = ht_grob)
+
+final_plot <- barplot + ht_plot +
+  plot_layout(widths = c(4, 1), guides = "collect") &
+  theme(legend.position = "bottom")
+
+final_plot
+
+ggsave(
+  filename = "Fig_4_Both_DESeq2_Barplot_Heatmap.svg",
+  plot = final_plot,  
+  path = file.path(path.figures),
+  width = 10,   height = 10,   dpi = 300 )
+
+```
+
+### Individual Correlation Plots
+```{r correlation_plots}
+# Function to get taxon label (Genus or Class)
+get_tax_label <- function(asv) {
+  g <- tax[asv, "Genus"]
+  c <- tax[asv, "Class"]
+
+  if (!is.na(g) && g != "") {
+    return(g)} 
+  else if (!is.na(c) && c != "") {return(paste0("Class: ", c))}
+  else {return("Taxon: Unknown")}
+}
+```
+
+```{r}
+#### Overlap Plots for Significant Correlation ASVs ------------------------
+plot_list <- list()
+
+for (i in seq_len(nrow(asvs_to_plot))) {
+
+  asv <- asvs_to_plot$ASV[i]
+  tax_label <- asvs_to_plot$Genus[i]
+
+  if (is.na(tax_label) || tax_label == "") {
+    tax_label <- "Uncharacterized"
+  }
+
+  # Prepare data (long format)
+  df_plot <- data.frame(
+    Abundance = as.numeric(normalized_abundance[asv, ]),
+    Fibrinogen = meta$FIBRINOGEN_MEAN,
+    Haptoglobin = meta$Haptoglobin_Mean
+  )
+
+  df_plot <- df_plot[df_plot$Abundance > 0, ]
+
+  df_long <- tidyr::pivot_longer(
+    df_plot,
+    cols = c(Fibrinogen, Haptoglobin),
+    names_to = "Marker",
+    values_to = "Inflammation"
+  )
+
+  # correlation values
+  rho_fb <- as.numeric(top_hits$fb_Spearman_rho[top_hits$ASV == asv][1])
+  p_fb   <- as.numeric(top_hits$fb_p_value[top_hits$ASV == asv][1])
+
+  rho_hp <- as.numeric(top_hits$hp_Spearman_rho[top_hits$ASV == asv][1])
+  p_hp   <- as.numeric(top_hits$hp_p_value[top_hits$ASV == asv][1])
+
+  label_text <- paste0(
+    "FB: rho=", round(rho_fb, 3), ", p=", signif(p_fb, 3), "\n",
+    "HP: rho=", round(rho_hp, 3), ", p=", signif(p_hp, 3)
+  )
+
+  p <- ggplot(df_long, aes(x = Inflammation, y = Abundance, color = Marker)) +
+    geom_point(size = 4, alpha = 0.7) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 0.8) +
+    labs(
+      title = bquote(.(asv) ~ "(" * italic(.(tax_label)) * ")"),
+      x = "Inflammation Marker",
+      y = "Normalized Abundance") +
+    scale_y_continuous(labels = scales::scientific) +
+    annotate(
+    "text",
+    x = -Inf, y = Inf,
+    label = label_text,
+    hjust = -0.05, vjust = 1.2, size = 3.2) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+      legend.position = "bottom"
+    )
+
+  plot_list[[asv]] <- p
+
+# Save
+ ggsave(
+    filename = file.path(path.figures, paste0("Correlation_", asv, ".svg")),
+    plot = p, width = 6, height = 5,  dpi= 300  )}
+```
+
+```{r correlation_plot}
+#### Facet Plots for Significant Correlation ASVs ------------------------
+plot_list <- list()
+
+for (i in seq_len(nrow(asvs_to_plot))) {
+
+  asv <- asvs_to_plot$ASV[i]
+  tax_label <- asvs_to_plot$Genus[i]
+  infl_status <- asvs_to_plot$Inflammation[asvs_to_plot$ASV == asv]
+
+  df_plot <- data.frame(
+    Abundance = as.numeric(normalized_abundance[asv, ]),
+    Fibrinogen = meta$FIBRINOGEN_MEAN,
+    Haptoglobin = meta$Haptoglobin_Mean)
+
+  df_plot <- df_plot[df_plot$Abundance > 0, ]
+
+  df_long <- tidyr::pivot_longer(
+    df_plot,
+    cols = c(Fibrinogen, Haptoglobin),
+    names_to = "Marker",
+    values_to = "Inflammation") %>%
+  dplyr::mutate(InflammationStatus = factor(
+      infl_status, levels = c("Normal", "Elevated")))
+
+  # correlation values
+  rho_fb <- as.numeric(top_hits$fb_Spearman_rho[top_hits$ASV == asv][1])
+  p_fb   <- as.numeric(top_hits$fb_p_value[top_hits$ASV == asv][1])
+
+  rho_hp <- as.numeric(top_hits$hp_Spearman_rho[top_hits$ASV == asv][1])
+  p_hp   <- as.numeric(top_hits$hp_p_value[top_hits$ASV == asv][1])
+
+  ann_df <- data.frame(
+    Marker = c("Fibrinogen", "Haptoglobin"),
+    label_text <- paste0(
+    "Fb: p=" , signif(p_fb, 3), "| ρ=", round(rho_fb, 3), "\n",
+    "Hp: p=", signif(p_hp, 3), "| ρ=", round(rho_hp, 3) ))
+      
+
+  p <- ggplot(df_long, aes(x = Inflammation, y = Abundance)) +
+    geom_point(aes(color = InflammationStatus), size = 4, alpha = 0.7) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 0.8, color = "black") +
+    facet_wrap(~ Marker, scales = "free_x") +
+    labs(
+      title = bquote(.(asv) ~ "(" * italic(.(tax_label)) * ")"),
+      x = "Inflammation Marker",
+      y = "Normalized Abundance"  ) +
+    scale_color_manual(values = c("Elevated" = "red","Normal"   = "blue")) +
+    scale_y_continuous(labels = scales::scientific) +
+    annotate(
+    "text",
+    x = -Inf, y = Inf, label = label_text, hjust = -0.05, vjust = 1.2, size = 3.2) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+      legend.position = "none")
+
+  plot_list[[asv]] <- p
+  
+# Save
+ ggsave(
+    filename = file.path(path.figures, paste0("Facet_Correlation_", asv, ".svg")),
+    plot = p, width = 6, height = 5,  dpi= 300  )}
+
+# Show the first ASV plot
+for (i in 1:3) {print(plot_list[[i]])}
+```
+
