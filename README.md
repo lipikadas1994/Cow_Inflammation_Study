@@ -80,99 +80,109 @@ This project investigates the relationship between fecal microbiota composition 
 - Identification of potential keystone taxa contributing to microbiome structure
 
 ---
-Data Description
+## Data Description
 
-Processed Data (Primary Use)
+### Processed Data (Primary Use)
+Located in `data/processed/`
 
-Located in data/processed/
+- `ps_updated.rds`  
+  → Final curated phyloseq object after:
+  - contaminant removal  
+  - mock exclusion  
+  - data curation  
 
-ps_updated.rds
-→ Final curated phyloseq object after:
+- `metadata_table.rds`  
+  → Cleaned metadata used for all downstream analyses  
+- `otu_table.rds`  
+  → Final OTU table 
+- `taxa_table.rds`  
+  → Final taxonomy table
+  
+**Stratified datasets:**
+- `ps_fibrinogen_normal_updated.rds`
+- `ps_fibrinogen_elevated_updated.rds`
+- `ps_haptoglobin_normal_updated.rds`
+- `ps_haptoglobin_elevated_updated.rds`
+- `ps_both_normal_updated.rds`
+- `ps_both_elevated_updated.rds`
 
-contaminant removal
-mock exclusion
-data curation
-metadata_table.rds
-→ Cleaned metadata used for all downstream analyses
+---
 
-otu_table.rds
-→ final OTU table
-
-taxa_table.rds
-→ final taxonomy table
-
-Stratified datasets:
-
-ps_fibrinogen_normal_updated.rds
-ps_fibrinogen_elevated_updated.rds
-ps_haptoglobin_normal_updated.rds
-ps_haptoglobin_elevated_updated.rds
-ps_both_normal_updated.rds
-ps_both_elevated_updated.rds
-Intermediate Data
-
-Located in data/intermediate/
+### Intermediate Data
+Located in `data/intermediate/`
 
 Includes intermediate phyloseq objects and preprocessing outputs:
 
-ps.decontam.rds
-ps.contam.rds
-ps.mock.rds
-ps.true_sample_cleaned.rds
-phyloseq.rds
-ps.pa.rds, ps.pa.pos.rds, ps.pa.neg.rds
-ps.sample_mock_cleaned.rds
-These files are retained for reproducibility but are not required for standard downstream analysis.
-Raw Data
+- `ps.decontam.rds`
+- `ps.contam.rds`
+- `ps.mock.rds`
+- `ps.true_sample_cleaned.rds`
+- `phyloseq.rds`
+- `ps.pa.rds`, `ps.pa.pos.rds`, `ps.pa.neg.rds`
+- `ps.sample_mock_cleaned.rds`
 
-Located in data/raw/
+> These files are retained for reproducibility but are not required for standard downstream analysis.
 
-1083_Microbiome_Metadata.csv
-Cow_FecalMicrobiome_Metadata_MERGED.csv
-SourceTracker Inputs:
+---
 
-source_metadata.csv, sink_metadata.csv
-source_otus.csv, sink_otus.csv
-Archived Data
+### Raw Data
+Located in `data/raw/`
 
-Located in archive/
+- `1083_Microbiome_Metadata.csv`
+- `Cow_FecalMicrobiome_Metadata_MERGED.csv`
 
-Older metadata versions:
+**SourceTracker Inputs:**
+- `source_metadata.csv`, `sink_metadata.csv`
+- `source_otus.csv`, `sink_otus.csv`
 
-Cow_FecalMicrobiome_Metadata-2-2.csv
-Deprecated notebooks:
+---
 
-Stored in archive/notebooks/
-These are preserved for version history and reproducibility.
-Analysis Workflows
+### Archived Data
+Located in `archive/`
 
-Final Notebooks
+**Older metadata versions:**
+- `Cow_FecalMicrobiome_Metadata-2-2.csv`
 
-Located in notebooks/
+**Deprecated notebooks:**
+- Stored in `archive/notebooks/`
 
-DADA2_Diversity_Updated.ipynb
-→ Microbiome processing and diversity analysis
+> These are preserved for version history and reproducibility.
 
-Network_SpiecEasi.ipynb
-→ Network inference and keystone taxa identification
+---
 
-Differential Abundance Results
+## Analysis Workflows
 
-Located in results/differential_abundance/DESeq2/
+### 📓 Final Notebooks
+Located in `notebooks/`
+
+- `DADA2_Diversity_Updated.ipynb`  
+  → Microbiome processing and diversity analysis  
+
+- `Network_SpiecEasi.ipynb`  
+  → Network inference and keystone taxa identification  
+
+---
+
+### Differential Abundance Results
+Located in `results/differential_abundance/DESeq2/`
 
 Contains rendered outputs from DESeq2 analyses:
 
-Fibrinogen-associated analysis
-Haptoglobin-associated analysis
-Combined inflammation analysis
-Includes:
+- Fibrinogen-associated analysis  
+- Haptoglobin-associated analysis  
+- Combined inflammation analysis  
 
-.Rmd files (analysis scripts)
-.html files (rendered reports)
-Recommended Starting Point
+**Includes:**
+- `.Rmd` files (analysis scripts)  
+- `.html` files (rendered reports)  
+
+---
+
+## Recommended Starting Point
 
 For most users:
 
-data/processed/ps_updated.rds
-data/processed/metadata_table.rds
-These files contain the finalized dataset used for all major analyses.
+- `data/processed/ps_updated.rds`
+- `data/processed/metadata_table.rds`
+
+> These files contain the finalized dataset used for all major analyses.
